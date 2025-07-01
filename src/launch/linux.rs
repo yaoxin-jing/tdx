@@ -203,10 +203,18 @@ pub struct InitVm {
 }
 
 impl InitVm {
-    pub fn new(cpuid_entries: &Vec<kvm_bindings::kvm_cpuid_entry2>) -> Self {
+    pub fn new(entries: &[kvm_bindings::kvm_cpuid_entry2]) -> Self {
+        // build a 256-element array, zero-initialised
+        let mut arr = [kvm_bindings::kvm_cpuid_entry2::default(); 256];
+
+        // copy as many entries as we actually have (max 256)
+        let n = entries.len().min(256);
+        arr[..n].copy_from_slice(&entries[..n]);
+
         Self {
-            cpuid_nent: cpuid_entries.len() as u32,
-            cpuid_entries: cpuid_entries.as_slice().try_into().unwrap(),
+            attributes: super::AttributesFlags::SEPT_VE_DISABLE.bits(),
+            cpuid_nent: n as u32,          // real count (≤ platform limit)
+            cpuid_entries: arr,
             ..Default::default()
         }
     }

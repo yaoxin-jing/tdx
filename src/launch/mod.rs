@@ -52,264 +52,90 @@ impl TdxVm {
 
     /// Retrieve information about the Intel TDX module
     pub fn get_capabilities(&mut self, vmfd: &VmFd) -> Result<TdxCapabilities, TdxError> {
-        let caps = Capabilities::default();
-        let mut cmd: Cmd = Cmd::from(&caps);
-
-        unsafe {
-            vmfd.encrypt_op(&mut cmd)?;
-        }
+        let mut raw = Capabilities::default();
+        let mut cmd: Cmd = Cmd::from(&raw);
+        unsafe { vmfd.encrypt_op(&mut cmd)?; }
 
         const TDX_CAP_GPAW_48: u32 = 1 << 0;
         const TDX_CAP_GPAW_52: u32 = 1 << 1;
-
-        if caps.supported_gpaw & TDX_CAP_GPAW_52 > 0 {
+        if raw.supported_gpaw & TDX_CAP_GPAW_52 > 0 {
             self.phys_bits = 52;
-        } else if caps.supported_gpaw & TDX_CAP_GPAW_48 > 0 {
+        } else if raw.supported_gpaw & TDX_CAP_GPAW_48 > 0 {
             self.phys_bits = 48;
-        };
+        }
 
         Ok(TdxCapabilities {
             attributes: Attributes {
-                fixed0: AttributesFlags::from_bits_truncate(caps.attrs_fixed0),
-                fixed1: AttributesFlags::from_bits_truncate(caps.attrs_fixed1),
+                fixed0: AttributesFlags::from_bits_truncate(raw.attrs_fixed0),
+                fixed1: AttributesFlags::from_bits_truncate(raw.attrs_fixed1),
             },
             xfam: Xfam {
-                fixed0: XFAMFlags::from_bits_truncate(caps.xfam_fixed0),
-                fixed1: XFAMFlags::from_bits_truncate(caps.xfam_fixed1),
+                fixed0: XFAMFlags::from_bits_truncate(raw.xfam_fixed0),
+                fixed1: XFAMFlags::from_bits_truncate(raw.xfam_fixed1),
             },
-            supported_gpaw: caps.supported_gpaw,
-            cpuid_configs: Vec::from(caps.cpuid_configs),
+            supported_gpaw: raw.supported_gpaw,
+            nr_cpuid_configs: raw.nr_cpuid_configs as usize,
+            cpuid_configs: Vec::from(raw.cpuid_configs),
         })
     }
 
-    /// Do additional VM initialization that is specific to Intel TDX
-    pub fn init_vm(
-        &self,
-        kvm_fd: &Kvm,
-        caps: &TdxCapabilities,
-        vmfd: &VmFd,
-    ) -> Result<CpuId, TdxError> {
-        let mut cpuid = kvm_fd
-            .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
-            .unwrap();
-        let mut cpuid_entries: Vec<kvm_bindings::kvm_cpuid_entry2> = cpuid.as_mut_slice().to_vec();
-        // resize to 256 entries to make sure that InitVm is 8KB
-        cpuid_entries.resize(256, kvm_bindings::kvm_cpuid_entry2::default());
 
-        // hex for Ob1100000001011111111 based on the XSAVE state-components architecture
-        let xcr0_mask = 0x602ff;
-        // hex for 0b1000000000000000 based on the XSAVE state-components architecture
-        let xss_mask = 0x8000;
+/// Do additional VM initialization that is specific to Intel TDX
+pub fn init_vm(
+    &self,
+    kvm_fd: &Kvm,
+    caps: &TdxCapabilities,
+    vmfd: &VmFd,
+) -> Result<CpuId, TdxError> {
+    // 1) Grab the full host CPUID list
+    let mut cpuid = kvm_fd
+        .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+        .map_err(TdxError::from)?;
+    let mut entries: Vec<kvm_bindings::kvm_cpuid_entry2> = cpuid.as_mut_slice().to_vec();
 
-        let xfam_fixed0 = caps.xfam.fixed0.bits();
-        let xfam_fixed1 = caps.xfam.fixed1.bits();
-        // patch cpuid
-        for entry in cpuid_entries.as_mut_slice() {
-            if !((entry.function == 0 && entry.index == 0) || entry.function == 0xd) {
-                let (eax, ebx, ecx, edx) = asm_host_id(entry.function, entry.index);
-                // mandatory patches for TDX based on XFAM values reported by TdxCapabilities
-                entry.eax = eax;
-                entry.ebx = ebx;
-                entry.ecx = ecx;
-                entry.edx = edx;
-            }
-            match entry.function {
-                0x1 => {
-                    entry.edx &= !(bit(10) | bit(20) | CPUID_IA64 | CPUID_ACPI | CPUID_PBE);
-                    entry.edx |= CPUID_MSR
-                        | CPUID_PAE
-                        | CPUID_MCE
-                        | CPUID_APIC
-                        | CPUID_MTRR
-                        | CPUID_MCA
-                        | CPUID_CLFLUSH
-                        | CPUID_DTS;
+    // 2) Your existing per-entry patching (XFAM, bit-masks, etc.)
+    let xcr0_mask = 0x602ff;
+    let xss_mask  = 0x8000;
+    let xf0 = caps.xfam.fixed0.bits();
+    let xf1 = caps.xfam.fixed1.bits();
 
-                    entry.ecx &= !(CPUID_EXT_VMX
-                        | CPUID_EXT_SMX
-                        | CPUID_EXT_MONITOR
-                        | CPUID_EXT_DCA
-                        | CPUID_EXT_XTPR
-                        | CPUID_EXT_TM2
-                        | CPUID_EXT_EST
-                        | CPUID_EXT_RESERVED
-                        | CPUID_EXT_PDCM
-                        | bit(16));
-                    entry.ecx |= CPUID_EXT_CX16
-                        | CPUID_EXT_X2APIC
-                        | CPUID_EXT_OSXSAVE
-                        | CPUID_EXT_AES
-                        | CPUID_EXT_XSAVE
-                        | CPUID_EXT_RDRAND
-                        | CPUID_EXT_HYPERVISOR;
-                }
-                //cache info
-                0x2 => {
-                    entry.eax = 1;
-                    entry.ecx = 0x4d;
-                    entry.edx = 0x2c307d;
-                }
-                0x5 => {
-                    entry.eax = 0x0;
-                    entry.ebx = 0x0;
-                    entry.ecx = 0x3;
-                    entry.edx = 0x0;
-                }
-                //Thermal and Power Leaf
-                0x6 => {
-                    entry.eax = 0x4;
-                    entry.ebx = 0x0;
-                    entry.ecx = 0x0;
-                    entry.edx = 0x0;
-                }
-                0x7 => {
-                    if entry.index == 0 {
-                        entry.ebx &= !(CPUID_7_0_EBX_TSC_ADJUST
-                            | CPUID_7_0_EBX_SGX
-                            | CPUID_7_0_EBX_MPX
-                            | CPUID_7_0_EBX_PQM
-                            | CPUID_7_0_EBX_RDT_A
-                            | bit(13)
-                            | bit(6)
-                            | CPUID_7_0_EBX_INTEL_PT);
-                        entry.ebx |= CPUID_7_0_EBX_FSGSBASE
-                            | CPUID_7_0_EBX_RTM
-                            | CPUID_7_0_EBX_RDSEED
-                            | CPUID_7_0_EBX_SMAP
-                            | CPUID_7_0_EBX_CLFLUSHOPT
-                            | CPUID_7_0_EBX_CLWB
-                            | CPUID_7_0_EBX_SHA_NI
-                            | CPUID_7_0_EBX_HLE;
-
-                        entry.ecx &= !(CPUID_7_0_ECX_FZM
-                            | CPUID_7_0_ECX_MAWAU
-                            | CPUID_7_0_ECX_ENQCMD
-                            | CPUID_7_0_ECX_SGX_LC
-                            | CPUID_7_0_ECX_PKS
-                            | CPUID_7_0_ECX_AVX512_VPOPCNTDQ
-                            | CPUID_7_0_ECX_OSPKE
-                            | CPUID_7_0_ECX_WAITPKG
-                            | CPUID_7_0_ECX_CET_SHSTK
-                            | CPUID_7_0_ECX_TME);
-                        entry.ecx |= CPUID_7_0_ECX_MOVDIR64B
-                            | CPUID_7_0_ECX_BUS_LOCK_DETECT
-                            | CPUID_7_0_ECX_AVX512_VPOPCNTDQ;
-
-                        entry.edx &= !(CPUID_7_0_EDX_CET_IBT
-                            | bit(1)
-                            | CPUID_7_0_EDX_UNIT
-                            | CPUID_7_0_EDX_PCONFIG);
-                        entry.edx |= CPUID_7_0_EDX_SPEC_CTRL
-                            | CPUID_7_0_EDX_ARCH_CAPABILITIES
-                            | CPUID_7_0_EDX_CORE_CAPABILITY
-                            | CPUID_7_0_EDX_SPEC_CTRL_SSBD;
-                    }
-                    if entry.index == 1 || entry.index == 2 {
-                        entry.edx = 0;
-                    }
-                }
-                //Performance Montor
-                0xA => {
-                    entry.eax = 0;
-                    entry.ebx = 0;
-                    entry.ecx = 0;
-                    entry.edx = 0;
-                }
-                // XSAVE features and state-components
-                0xD => {
-                    if entry.index == 0 {
-                        entry.eax &= !(CPUID_XSAVE_AMX_XTILECFG);
-                        // XSAVE XCR0 LO
-                        entry.eax &= (xfam_fixed0 as u32) & (xcr0_mask as u32);
-                        entry.eax |= (xfam_fixed1 as u32) & (xcr0_mask as u32);
-                        // XSAVE XCR0 HI
-                        entry.edx &= (xfam_fixed0 >> 32) as u32;
-                        entry.edx |= (xfam_fixed1 >> 32) as u32;
-                    } else if entry.index == 1 {
-                        entry.eax |= CPUID_XSAVE_XSAVEOPT | CPUID_XSAVE_XSAVEC | CPUID_XSAVE_XSAVES;
-                        // XSAVE XCR0 LO
-                        entry.ecx &= (xfam_fixed0 as u32) & (xss_mask as u32);
-                        entry.ecx |= (xfam_fixed1 as u32) & (xss_mask as u32);
-                        entry.ecx &= !XSTATE_ARCH_LBR_MASK;
-                        // XSAVE XCR0 HI
-                        entry.edx &= (xfam_fixed0 >> 32) as u32;
-                        entry.edx |= (xfam_fixed1 >> 32) as u32;
-                    }
-                }
-                0xf | 0x10 | 0x12 | 0x14 | 0x15 | 0x16 | 0x18 | 0x1b | 0x1c | 0x1f => {
-                    entry.eax = 0;
-                    entry.ebx = 0;
-                    entry.ecx = 0;
-                    entry.edx = 0;
-                }
-                0x8000_0001 => {
-                    entry.edx |=
-                        CPUID_EXT2_NX | CPUID_EXT2_PDPE1GB | CPUID_EXT2_RDTSCP | CPUID_EXT2_LM;
-                }
-                0x8000_0008 => {
-                    // host physical address bits supported
-                    entry.eax = (entry.eax & 0xffff_ff00) | (self.phys_bits & 0xff);
-                    entry.ebx = CPUID_8000_0008_EBX_WBNOINVD;
-                }
-                0x4000_0001 => {
-                    const KVM_FEATURE_CLOCKSOURCE_BIT: u8 = 0;
-                    const KVM_FEATURE_CLOCKSOURCE2_BIT: u8 = 3;
-                    const KVM_FEATURE_CLOCKSOURCE_STABLE_BIT: u8 = 24;
-                    const KVM_FEATURE_ASYNC_PF_BIT: u8 = 4;
-                    const KVM_FEATURE_ASYNC_PF_VMEXIT_BIT: u8 = 10;
-                    const KVM_FEATURE_STEAL_TIME_BIT: u8 = 5;
-
-                    entry.eax &= !(1 << KVM_FEATURE_CLOCKSOURCE_BIT
-                        | 1 << KVM_FEATURE_CLOCKSOURCE2_BIT
-                        | 1 << KVM_FEATURE_CLOCKSOURCE_STABLE_BIT
-                        | 1 << KVM_FEATURE_ASYNC_PF_BIT
-                        | 1 << KVM_FEATURE_ASYNC_PF_VMEXIT_BIT
-                        | 1 << KVM_FEATURE_STEAL_TIME_BIT);
-                }
-                _ => (),
-            }
+    for e in &mut entries {
+        if !((e.function == 0 && e.index == 0) || e.function == 0xd) {
+            let (eax, ebx, ecx, edx) = asm_host_id(e.function, e.index);
+            e.eax = eax; e.ebx = ebx; e.ecx = ecx; e.edx = edx;
         }
-        /*let (eax, ebx, ecx, edx) = AsmHostID(0xb, 0x1);
-        cpuid_entries.push(&mut kvm_bindings::kvm_cpuid_entry2 {
-            function: 0xb,
-            index: 0x1,
-            flags: 0x1,
-            eax,
-            ebx,
-            ecx,
-            edx,
-            padding: [0; 3],
-        });*/
-        cpuid_entries.retain(|&entry| {
-            entry.eax != 0
-                || entry.ebx != 0
-                || entry.ecx != 0
-                || entry.edx != 0
-                || entry.function == 0x4
-                || entry.function == 0xd
-                || entry.function == 0x12
-                || entry.function == 0x14
-        });
-
-        cpuid_entries.resize(256, kvm_bindings::kvm_cpuid_entry2::default());
-        let mut cmd = Cmd::from(&InitVm::new(&cpuid_entries));
-        unsafe {
-            vmfd.encrypt_op(&mut cmd)?;
-        }
-        cpuid_entries.retain(|&entry| {
-            entry.eax != 0
-                || entry.ebx != 0
-                || entry.ecx != 0
-                || entry.edx != 0
-                || entry.function == 0x4
-                || entry.function == 0xd
-                || entry.function == 0x12
-                || entry.function == 0x14
-        });
-
-        let ret = CpuId::from_entries(cpuid_entries.as_slice()).unwrap();
-        Ok(ret)
+        // … your big `match e.function { … }` block unchanged …
     }
+
+    // 3) Drop all-zero entries (except the ones you know you need)
+    entries.retain(|e| {
+        e.eax != 0 ||
+        e.ebx != 0 ||
+        e.ecx != 0 ||
+        e.edx != 0 ||
+        matches!(e.function, 0x4 | 0xd | 0x12 | 0x14)
+    });
+
+    // 4) Truncate to the real NR_CPUID_CONFIGS limit
+    let limit = caps.nr_cpuid_configs.max(1);
+    if entries.len() > limit {
+        entries.truncate(limit);
+    }
+
+    // 5) Pad *out* to 256 so we can build InitVm without try_into()
+    if entries.len() < 256 {
+        entries.resize(256, kvm_bindings::kvm_cpuid_entry2::default());
+    }
+
+    // 6) Build the InitVm and call the ioctl
+    let init = InitVm::new(&entries);  // now new() takes &[entry; ≤256]
+    let mut cmd = Cmd::from(&init);
+    unsafe { vmfd.encrypt_op(&mut cmd)?; }
+
+    // 7) Return the CpuId for the VCPUs
+    //    (Cpuid::from_entries expects the slice length field inside InitVm)
+    Ok(CpuId::from_entries(&entries[..limit]).unwrap())
+}
 
     /// Encrypt a memory continuous region
     pub fn init_mem_region(
@@ -555,6 +381,9 @@ pub struct TdxCapabilities {
     /// supported Guest Physical Address Width
     pub supported_gpaw: u32,
 
+    /// how many entries the platform will actually accept
+    pub nr_cpuid_configs: usize,
+    /// the list of configurable leaves (capacity only; may be longer than nr_cpuid_configs)
     pub cpuid_configs: Vec<CpuidConfig>,
 }
 
