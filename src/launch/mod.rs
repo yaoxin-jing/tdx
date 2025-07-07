@@ -78,6 +78,7 @@ impl TdxVm {
                 fixed1: XFAMFlags::from_bits_truncate(caps.xfam_fixed1),
             },
             supported_gpaw: caps.supported_gpaw,
+            nr_cpuid_configs: caps.nr_cpuid_configs as usize,
             cpuid_configs: Vec::from(caps.cpuid_configs),
         })
     }
@@ -291,7 +292,16 @@ impl TdxVm {
                 || entry.function == 0x14
         });
 
-        cpuid_entries.resize(256, kvm_bindings::kvm_cpuid_entry2::default());
+        let limit = caps.nr_cpuid_configs.max(1);
+        if cpuid_entries.len() > limit {
+            cpuid_entries.truncate(limit);
+        }
+
+        // 5) Pad *out* to 256 so we can build InitVm without try_into()
+        if cpuid_entries.len() < 256 {
+            cpuid_entries.resize(256, kvm_bindings::kvm_cpuid_entry2::default());
+        }
+
         let mut cmd = Cmd::from(&InitVm::new(&cpuid_entries));
         unsafe {
             vmfd.encrypt_op(&mut cmd)?;
@@ -554,7 +564,7 @@ pub struct TdxCapabilities {
 
     /// supported Guest Physical Address Width
     pub supported_gpaw: u32,
-
+    pub nr_cpuid_configs: usize,
     pub cpuid_configs: Vec<CpuidConfig>,
 }
 
